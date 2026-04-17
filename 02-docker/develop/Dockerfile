@@ -21,7 +21,7 @@ COPY 02-docker/develop/app.py .
 
 # Bước 6: Copy mock utils (from build context root)
 RUN mkdir -p utils
-COPY utils/mock_llm.py utils/
+COPY 01-localhost-vs-production/develop/utils/mock_llm.py utils/
 
 # Bước 7: Expose port để documentation (không bắt buộc)
 EXPOSE 8000
