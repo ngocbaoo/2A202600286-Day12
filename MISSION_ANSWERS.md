@@ -91,6 +91,24 @@ graph TD
     -   **Autoscaling**: Cấu hình `minScale` (giảm cold start) và `maxScale` (kiểm soát chi phí).
     -   **Resources**: Giới hạn CPU và RAM rõ ràng.
     -   **Health Checks**: Sử dụng `livenessProbe` và `startupProbe` để hệ thống tự phục hồi nếu app gặp lỗi.
+    
+## Part 4: API Security
+
+### Exercise 4.1: API Key authentication
+
+1.  **API key được check ở đâu?**: Được kiểm tra trong hàm `verify_api_key` (Dependency Injection). FastAPI sẽ kiểm tra header `X-API-Key` trước khi cho phép request đi vào logic xử lý của endpoint `/ask`.
+2.  **Điều gì xảy ra nếu sai key?**:
+    -   **401 Unauthorized**: Nếu người dùng không gửi kèm header `X-API-Key`.
+    -   **403 Forbidden**: Nếu gửi key nhưng không khớp với giá trị `AGENT_API_KEY` được cấu hình trên server.
+3.  **Làm sao rotate key?**: Thay đổi giá trị của biến môi trường `AGENT_API_KEY` trên hệ thống quản lý (như Dashboard của Railway/Render) và khởi động lại dịch vụ. Toàn bộ các request sau đó sẽ yêu cầu Key mới.
+
+### Exercise 4.3: Rate limiting 
+
+1.  **Algorithm nào được dùng?**: Thuật toán **Sliding Window Counter** (Cửa sổ trượt). Nó chính xác hơn Fixed Window vì không bị bùng nổ request ở thời điểm chuyển giao giữa 2 phút.
+2.  **Limit là bao nhiêu requests/minute?**:
+    -   **User mới/vô danh**: 10 requests/phút.
+    -   **Admin**: 100 requests/phút.
+3.  **Làm sao bypass limit cho admin?**: Sử dụng cơ chế phân tầng (Tiered limiting). Admin không bị áp dụng chung bộ đếm với user thường mà có một instance `rate_limiter_admin` riêng biệt với hạn mức cao hơn rất nhiều.
 
 
 

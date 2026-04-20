@@ -57,6 +57,26 @@ class CostGuard:
             self._records[user_id] = UsageRecord(user_id=user_id, day=today)
         return self._records[user_id]
 
+    def check_budget_redis(self, user_id: str, estimated_cost: float, r: 'redis.Redis') -> bool:
+        """
+        Implementation for Exercise 4.4:
+        Return True nếu còn budget, False nếu vượt.
+        Mỗi user có budget $1/ngày (hoặc cấu hình tùy ý)
+        """
+        month_key = time.strftime("%Y-%m")
+        key = f"budget:{user_id}:{month_key}"
+        
+        # Lấy chi tiêu hiện tại
+        current = float(r.get(key) or 0)
+        
+        if current + estimated_cost > self.daily_budget_usd:
+            return False
+            
+        # Cập nhật chi tiêu mới
+        r.incrbyfloat(key, estimated_cost)
+        r.expire(key, 32 * 24 * 3600) # Lưu 32 ngày
+        return True
+
     def check_budget(self, user_id: str) -> None:
         """
         Kiểm tra budget trước khi gọi LLM.

@@ -31,8 +31,10 @@ import uvicorn
 
 from app.config import settings
 
-# Mock LLM (thay bằng OpenAI/Anthropic khi có API key)
-from utils.mock_llm import ask as llm_ask
+# ─────────────────────────────────────────────────────────
+# Agent Core — From Lab 5
+# ─────────────────────────────────────────────────────────
+from app.core.agent_engine import run_clinical_agent
 
 # ─────────────────────────────────────────────────────────
 # Logging — JSON structured
@@ -49,39 +51,57 @@ _request_count = 0
 _error_count = 0
 
 # ─────────────────────────────────────────────────────────
-# Simple In-memory Rate Limiter
-# ─────────────────────────────────────────────────────────
-_rate_windows: dict[str, deque] = defaultdict(deque)
+# Redis client (Optional fallback to In-memory logic)
+r = None
+if settings.redis_url:
+    try:
+        import redis
+        r = redis.from_url(settings.redis_url, decode_responses=True)
+        # Kiểm tra kết nối ngay lập tức
+        r.ping()
+        logger.info("✅ Connected to Redis")
+    except Exception as e:
+        logger.warning(f"⚠️ Redis connection failed: {e}. Falling back to limited in-memory mode.")
+        r = None
+else:
+    logger.info("ℹ️ No REDIS_URL provided. Running in in-memory mode.")
 
 def check_rate_limit(key: str):
-    now = time.time()
-    window = _rate_windows[key]
-    while window and window[0] < now - 60:
-        window.popleft()
-    if len(window) >= settings.rate_limit_per_minute:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded: {settings.rate_limit_per_minute} req/min",
-            headers={"Retry-After": "60"},
-        )
-    window.append(now)
+    if not r:
+        return # Bỏ qua rate limit nếu không có redis (hoặc có thể dùng in-memory simple logic)
+    try:
+        now = time.time()
+        redis_key = f"rate:{key}"
+        # Dùng Sliding Window với Redis Sorted Set
+        pipe = r.pipeline()
+        pipe.zremrangebyscore(redis_key, 0, now - 60)
+        pipe.zadd(redis_key, {str(now): now})
+        pipe.zcard(redis_key)
+        pipe.expire(redis_key, 60)
+        results = pipe.execute()
+        
+        count = results[2]
+        if count > settings.rate_limit_per_minute:
+            raise HTTPException(429, f"Rate limit exceeded: {settings.rate_limit_per_minute} req/min")
+    except redis.ConnectionError:
+        logger.warning("Redis offline - bypassing rate limit")
 
-# ─────────────────────────────────────────────────────────
-# Simple Cost Guard
-# ─────────────────────────────────────────────────────────
-_daily_cost = 0.0
-_cost_reset_day = time.strftime("%Y-%m-%d")
-
-def check_and_record_cost(input_tokens: int, output_tokens: int):
-    global _daily_cost, _cost_reset_day
-    today = time.strftime("%Y-%m-%d")
-    if today != _cost_reset_day:
-        _daily_cost = 0.0
-        _cost_reset_day = today
-    if _daily_cost >= settings.daily_budget_usd:
-        raise HTTPException(503, "Daily budget exhausted. Try tomorrow.")
-    cost = (input_tokens / 1000) * 0.00015 + (output_tokens / 1000) * 0.0006
-    _daily_cost += cost
+def check_and_record_cost(user_id: str, input_tokens: int, output_tokens: int):
+    if not r:
+        return
+    try:
+        today = time.strftime("%Y-%m-%d")
+        redis_key = f"cost:{user_id}:{today}"
+        
+        current_cost = float(r.get(redis_key) or 0)
+        if current_cost >= settings.daily_budget_usd:
+            raise HTTPException(503, "Daily budget exhausted")
+            
+        cost = (input_tokens / 1000) * 0.00015 + (output_tokens / 1000) * 0.0006
+        r.incrbyfloat(redis_key, cost)
+        r.expire(redis_key, 86400)
+    except (redis.ConnectionError, AttributeError):
+        pass
 
 # ─────────────────────────────────────────────────────────
 # Auth
@@ -145,7 +165,8 @@ async def request_middleware(request: Request, call_next):
         # Security headers
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers.pop("server", None)
+        if "server" in response.headers:
+            del response.headers["server"]
         duration = round((time.time() - start) * 1000, 1)
         logger.info(json.dumps({
             "event": "request",
@@ -162,15 +183,17 @@ async def request_middleware(request: Request, call_next):
 # ─────────────────────────────────────────────────────────
 # Models
 # ─────────────────────────────────────────────────────────
-class AskRequest(BaseModel):
-    question: str = Field(..., min_length=1, max_length=2000,
-                          description="Your question for the agent")
+class AgentRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=2000)
 
-class AskResponse(BaseModel):
+class AgentResponse(BaseModel):
     question: str
     answer: str
     model: str
     timestamp: str
+
+def get_client_ip(request: Request) -> str:
+    return request.client.host if request.client else "127.0.0.1"
 
 # ─────────────────────────────────────────────────────────
 # Endpoints
@@ -190,41 +213,62 @@ def root():
     }
 
 
-@app.post("/ask", response_model=AskResponse, tags=["Agent"])
-async def ask_agent(
-    body: AskRequest,
-    request: Request,
-    _key: str = Depends(verify_api_key),
+@app.post("/ask", response_model=AgentResponse, tags=["Agent"])
+async def ask(
+    request: AgentRequest,
+    client_ip: str = Depends(get_client_ip),
+    user_id: str = Depends(verify_api_key)
 ):
-    """
-    Send a question to the AI agent.
+    """EntryPoint chính cho Agent - Đã tích hợp Security & Stateless History."""
+    # 1. Rate Limiting (Redis-based)
+    check_rate_limit(user_id)
+    
+    start_time = time.time()
+    try:
+        # 2. Lấy lịch sử hội thoại từ Redis (Stateless Design)
+        formatted_history = []
+        history_key = f"history:{user_id}"
+        
+        if r:
+            raw_history = r.lrange(history_key, 0, 9)  # Lấy 10 tin nhắn gần nhất
+            chat_history = [json.loads(h) for h in raw_history]
+            
+            # 3. Map message sang format LangChain (Human/AI)
+            for h in chat_history:
+                formatted_history.append(("human", h["q"]))
+                formatted_history.append(("ai", h["a"]))
 
-    **Authentication:** Include header `X-API-Key: <your-key>`
-    """
-    # Rate limit per API key
-    check_rate_limit(_key[:8])  # use first 8 chars as key bucket
+        # 4. Gọi Agent thực tế
+        answer = run_clinical_agent(request.question, chat_history=formatted_history)
+        
+        # 5. Lưu lại lịch sử mới vào Redis (nếu có)
+        if r:
+            new_interaction = json.dumps({"q": request.question, "a": answer}, ensure_ascii=False)
+            r.lpush(history_key, new_interaction)
+            r.ltrim(history_key, 0, 9)
+            r.expire(history_key, 1800)
+        
+        # 6. Tracking Cost
+        q_len = len(request.question)
+        a_len = len(answer)
+        check_and_record_cost(user_id, q_len, a_len)
 
-    # Budget check
-    input_tokens = len(body.question.split()) * 2
-    check_and_record_cost(input_tokens, 0)
+        elapsed = (time.time() - start_time) * 1000
+        logger.info(f'{{"event": "agent_call", "user": "{user_id}", "ms": {elapsed:.1f}}}')
 
-    logger.info(json.dumps({
-        "event": "agent_call",
-        "q_len": len(body.question),
-        "client": str(request.client.host) if request.client else "unknown",
-    }))
+        return AgentResponse(
+            question=request.question,
+            answer=answer,
+            model=settings.llm_model,
+            timestamp=datetime.now().isoformat()
+        )
 
-    answer = llm_ask(body.question)
-
-    output_tokens = len(answer.split()) * 2
-    check_and_record_cost(0, output_tokens)
-
-    return AskResponse(
-        question=body.question,
-        answer=answer,
-        model=settings.llm_model,
-        timestamp=datetime.now(timezone.utc).isoformat(),
-    )
+    except HTTPException:
+        raise
+    except Exception as e:
+        elapsed = (time.time() - start_time) * 1000
+        logger.error(f"Agent flow error: {str(e)}")
+        raise HTTPException(500, f"Internal Server Error: {str(e)}")
 
 
 @app.get("/health", tags=["Operations"])
@@ -247,8 +291,13 @@ def health():
 def ready():
     """Readiness probe. Load balancer stops routing here if not ready."""
     if not _is_ready:
-        raise HTTPException(503, "Not ready")
-    return {"ready": True}
+        raise HTTPException(503, "App not initialized")
+    try:
+        r.ping()
+        return {"ready": True, "redis": "connected"}
+    except Exception as e:
+        logger.error(f"Readiness check failed: {str(e)}")
+        raise HTTPException(503, "Redis connection failed")
 
 
 @app.get("/metrics", tags=["Operations"])

@@ -66,7 +66,7 @@ def run_checks():
     for f in ["app/main.py", "app/config.py"]:
         fpath = os.path.join(base, f)
         if os.path.exists(fpath):
-            content = open(fpath).read()
+            content = open(fpath, encoding="utf-8").read()
             for bad in ["sk-", "password123", "hardcoded"]:
                 if bad in content:
                     secrets_found.append(f"{f}:{bad}")
